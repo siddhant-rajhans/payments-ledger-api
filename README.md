@@ -1,10 +1,12 @@
 # Payments Ledger API
 
-![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
-![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?logo=postgresql&logoColor=white)
 ![Tests: 17 passing](https://img.shields.io/badge/tests-17%20passing-brightgreen)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-Double-entry payments ledger API in FastAPI and Postgres. Every transfer writes balanced debit and credit journal entries in a single serializable transaction. Idempotency keys on POST /transfers guarantee that a retried request returns the first result and never moves money twice. Row-level locks ordered by account ID prevent both deadlocks and negative balances under concurrent load. Reversals create new offsetting entries rather than mutating history, preserving a complete audit trail.
+Double-entry payments ledger API in FastAPI and Postgres. Every transfer writes balanced debit and credit journal entries in a single serializable transaction. Idempotency keys on `POST /transfers` guarantee that a retried request returns the first result and never moves money twice. Row-level locks ordered by account ID prevent both deadlocks and negative balances under concurrent load. Reversals create new offsetting entries rather than mutating history, preserving a complete audit trail.
 
 ## Measured Results
 
@@ -24,29 +26,53 @@ Benchmarked on AMD Ryzen 5 3550H (4C/8T), 2 GB RAM, embedded Postgres via pgserv
 
 ## Architecture
 
-```mermaid
-graph TD
-    C[Client] -->|POST /transfers<br>Idempotency-Key header| API[FastAPI]
-    API --> IK{Idempotency<br>Key Exists?}
-    IK -->|Yes| RET[Return Cached Result]
-    IK -->|No| LOCK[Lock Accounts<br>ORDER BY id]
-    LOCK --> BAL{Sufficient<br>Balance?}
-    BAL -->|No + no overdraft| REJECT[422 Insufficient Funds]
-    BAL -->|Yes or overdraft| WRITE[Write Transfer +<br>Debit Entry +<br>Credit Entry]
-    WRITE --> COMMIT[COMMIT]
-    COMMIT --> RESP[201 Created]
-
-    subgraph Postgres
-        T[transfers] --- J[journal_entries]
-        J --- A[accounts]
-    end
-
-    subgraph Reconciliation
-        RECON[GET /reconciliation] --> SCAN[Recompute all balances<br>from journal entries]
-        SCAN --> DIFF{Debits == Credits?}
-        DIFF -->|Yes| OK[balanced: true]
-        DIFF -->|No| ALERT[Report discrepancies]
-    end
+```
+                          ┌─────────┐
+                          │ Client  │
+                          └────┬────┘
+                               │
+                     POST /transfers
+                   Idempotency-Key: ...
+                               │
+                               ▼
+┌─────────────────────────────────────────────────┐
+│                  FastAPI Gateway                 │
+│                                                 │
+│  ┌───────────────────┐   ┌───────────────────┐  │
+│  │  Idempotency Key  │   │   Balance Check   │  │
+│  │     Lookup        │   │   + Row Locks     │  │
+│  │                   │   │  ORDER BY acct id │  │
+│  │  Key exists?      │   │                   │  │
+│  │  ├─ yes: return   │   │  Sufficient?      │  │
+│  │  │   cached 201   │   │  ├─ no:  422      │  │
+│  │  └─ no: continue  │   │  └─ yes: continue │  │
+│  └─────────┬─────────┘   └─────────┬─────────┘  │
+│            │                       │             │
+│            └───────────┬───────────┘             │
+│                        ▼                         │
+│         ┌────────────────────────────┐           │
+│         │   Double-Entry Write       │           │
+│         │                            │           │
+│         │   1. INSERT transfer       │           │
+│         │   2. INSERT debit entry    │           │
+│         │   3. INSERT credit entry   │           │
+│         │                            │           │
+│         │   (single SERIALIZABLE txn)│           │
+│         └────────────┬───────────────┘           │
+│                      │                           │
+└──────────────────────┼───────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│                   PostgreSQL                     │
+│                                                  │
+│  ┌──────────┐  ┌─────────────────┐  ┌─────────┐ │
+│  │ accounts │◄─┤ journal_entries ├─►│transfers│ │
+│  └──────────┘  └─────────────────┘  └─────────┘ │
+│                                                  │
+│  Balance = SUM(credits) - SUM(debits)            │
+│  Reconciliation: global debit == global credit   │
+└──────────────────────────────────────────────────┘
 ```
 
 ## API
@@ -62,17 +88,30 @@ graph TD
 | GET | `/reconciliation` | Recompute all balances and verify global balance |
 | GET | `/health` | Database connectivity check |
 
-## Design Decisions
+<details>
+<summary><strong>Design Decisions</strong></summary>
 
-- **Integer arithmetic for money.** Amounts are stored as `BIGINT` cents, never floats. This eliminates rounding errors that compound across thousands of transactions, which is the same reason Stripe and every payment processor uses integer-cent representation.
+### Integer arithmetic for money
 
-- **Ordered row locks for deadlock prevention.** Both accounts are locked with `SELECT ... FOR UPDATE` sorted by UUID. Without ordering, two concurrent transfers A->B and B->A can deadlock. Sorting guarantees a consistent lock acquisition order across all transactions.
+Amounts are stored as `BIGINT` cents, never floats. This eliminates rounding errors that compound across thousands of transactions, which is the same reason Stripe and every payment processor uses integer-cent representation.
 
-- **Idempotency keys in the database, not a cache.** Keys are stored with a UNIQUE constraint on the transfers table. A Redis TTL cache would lose keys on restart, allowing duplicate charges during recovery. The database constraint is durable and survives restarts.
+### Ordered row locks for deadlock prevention
 
-- **Reversals as new entries, never mutations.** Reversing a transfer creates a new transfer with inverted debit/credit entries. The original entries are never modified or deleted. This preserves a complete, tamper-evident audit trail where every state change is traceable.
+Both accounts are locked with `SELECT ... FOR UPDATE` sorted by UUID. Without ordering, two concurrent transfers A->B and B->A can deadlock. Sorting guarantees a consistent lock acquisition order across all transactions.
 
-- **Balance recomputed from the journal on every read.** `GET /accounts/{id}` computes balance as `SUM(credits) - SUM(debits)` rather than caching it in a mutable column. This eliminates write-write races on a balance column and makes the reconciliation endpoint a simple `SUM` comparison rather than a reconciliation against a separate counter.
+### Idempotency keys in the database, not a cache
+
+Keys are stored with a UNIQUE constraint on the transfers table. A Redis TTL cache would lose keys on restart, allowing duplicate charges during recovery. The database constraint is durable and survives restarts.
+
+### Reversals as new entries, never mutations
+
+Reversing a transfer creates a new transfer with inverted debit/credit entries. The original entries are never modified or deleted. This preserves a complete, tamper-evident audit trail where every state change is traceable.
+
+### Balance recomputed from the journal on every read
+
+`GET /accounts/{id}` computes balance as `SUM(credits) - SUM(debits)` rather than caching it in a mutable column. This eliminates write-write races on a balance column and makes the reconciliation endpoint a simple `SUM` comparison rather than a reconciliation against a separate counter.
+
+</details>
 
 ## Quick Start
 
@@ -131,6 +170,16 @@ make test
 ```bash
 docker compose up -d
 python scripts/run_benchmark.py --transfers 1000 --concurrency 32
+```
+
+## Tests
+
+```
+tests/test_transfers.py       7 tests  CRUD, overdraft, reversal
+tests/test_idempotency.py     3 tests  dedup, retry storm, distinct keys
+tests/test_concurrency.py     3 tests  parallel transfers, overdraft races, bidirectional
+tests/test_property.py        2 tests  global balance invariant, reversal restoration
+tests/test_reconciliation.py  2 tests  empty and post-transfer reconciliation
 ```
 
 ## Project Structure
